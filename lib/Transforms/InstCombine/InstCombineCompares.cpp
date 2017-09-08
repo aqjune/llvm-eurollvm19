@@ -3712,7 +3712,7 @@ Instruction *InstCombiner::foldICmpWithCastAndCast(ICmpInst &ICmp) {
   if (LHSCI->getOpcode() == Instruction::PtrToInt &&
       CompatibleSizes(SrcTy, DestTy)) {
     Value *RHSOp = nullptr;
-    if (auto *RHSC = dyn_cast<PtrToIntOperator>(ICmp.getOperand(1))) {
+    /* if (auto *RHSC = dyn_cast<PtrToIntOperator>(ICmp.getOperand(1))) {
       Value *RHSCIOp = RHSC->getOperand(0);
       if (RHSCIOp->getType()->getPointerAddressSpace() ==
           LHSCIOp->getType()->getPointerAddressSpace()) {
@@ -3721,7 +3721,7 @@ Instruction *InstCombiner::foldICmpWithCastAndCast(ICmpInst &ICmp) {
         if (LHSCIOp->getType() != RHSOp->getType())
           RHSOp = Builder.CreateBitCast(RHSOp, LHSCIOp->getType());
       }
-    } else if (auto *RHSC = dyn_cast<Constant>(ICmp.getOperand(1))) {
+    } else */ if (auto *RHSC = dyn_cast<Constant>(ICmp.getOperand(1))) {
       RHSOp = ConstantExpr::getIntToPtr(RHSC, SrcTy);
     }
 
