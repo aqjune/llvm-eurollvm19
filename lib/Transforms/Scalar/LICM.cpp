@@ -1710,7 +1710,7 @@ bool isKnownNonEscaping(Value *Object, const TargetLibraryInfo *TLI) {
   //      weaker condition and handle only AllocLikeFunctions (which are
   //      known to be noalias).  TODO
   return isAllocLikeFn(Object, TLI) &&
-    !PointerMayBeCaptured(Object, true, true);
+    !PointerMayBeCaptured(Object, true, true, TLI);
 }
 
 } // namespace
@@ -1915,7 +1915,7 @@ bool llvm::promoteLoopAccessesToScalars(
       Value *Object = GetUnderlyingObject(SomePtr, MDL);
       SafeToInsertStore =
           (isAllocLikeFn(Object, TLI) || isa<AllocaInst>(Object)) &&
-          !PointerMayBeCaptured(Object, true, true);
+          !PointerMayBeCaptured(Object, true, true, TLI);
     }
   }
 
