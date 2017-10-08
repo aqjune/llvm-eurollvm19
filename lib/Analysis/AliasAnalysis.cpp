@@ -565,45 +565,55 @@ ModRefInfo AAResults::callCapturesBefore(const Instruction *I,
   if (!Call || Call == Object)
     return ModRefInfo::ModRef;
 
+  // CallbackFunc is a function that PointerMayBeCapturedBefore calls
+  // whenever it visits use of a pointer which is based on Object.
+  // This CallbackFunc updates ArgModRefInfo, which is mod/ref info
+  // telling whether call site I mod/refs a pointer based on Object.
+  // Capturing a pointer is always regarded as ModRefInfo::ModRef.
+  ModRefInfo ArgModRefInfo = ModRefInfo::NoModRef;
+  auto CallbackFunc = [&ArgModRefInfo, &I, &Call, &Object](const Use* U) {
+    if (U->getUser() != I)
+      // Interested in instruction I only.
+      return;
+    if (ArgModRefInfo == ModRefInfo::ModRef)
+      // Already in the worst case.
+      return;
+
+    const Value *V = U->get();
+    unsigned ArgNo = 0;
+    for (auto CI = Call->data_operands_begin(), CE = Call->data_operands_end();
+         CI != CE; ++CI, ++ArgNo) {
+      if (V != (*CI))
+        continue;
+      // If V is passed to argument which is neither nocapture nor byval,
+      // the callee (call site I) captures the pointer V. In this case, return
+      // value of callCapturesBefore is set to be ModRefInfo::ModRef.
+      if (!Call->doesNotCapture(ArgNo) &&
+           ArgNo < Call->getNumArgOperands() && !Call->isByValArgument(ArgNo)) {
+        ArgModRefInfo = ModRefInfo::ModRef;
+        break;
+      }
+
+      if (Call->doesNotAccessMemory(ArgNo))
+        continue;
+      if (Call->onlyReadsMemory(ArgNo)) {
+        ArgModRefInfo = ModRefInfo::Ref;
+        continue;
+      }
+      // Otherwise, callee may modify memory.
+      ArgModRefInfo = ModRefInfo::ModRef;
+      break;
+    }
+  };
   if (PointerMayBeCapturedBefore(Object, /* ReturnCaptures */ true,
                                  /* StoreCaptures */ true, I, DT, &TLI,
                                  /* include Object */ true,
-                                 /* OrderedBasicBlock */ OBB))
+                                 /* OrderedBasicBlock */ OBB,
+                                 /* MaxUsesToExplore */ DefaultMaxUsesToExplore,
+                                 /* Callback function*/ CallbackFunc))
     return ModRefInfo::ModRef;
 
-  unsigned ArgNo = 0;
-  ModRefInfo R = ModRefInfo::NoModRef;
-  bool IsMustAlias = true;
-  // Set flag only if no May found and all operands processed.
-  for (auto CI = Call->data_operands_begin(), CE = Call->data_operands_end();
-       CI != CE; ++CI, ++ArgNo) {
-    // Only look at the no-capture or byval pointer arguments.  If this
-    // pointer were passed to arguments that were neither of these, then it
-    // couldn't be no-capture.
-    if (!(*CI)->getType()->isPointerTy() ||
-        (!Call->doesNotCapture(ArgNo) && ArgNo < Call->getNumArgOperands() &&
-         !Call->isByValArgument(ArgNo)))
-      continue;
-
-    AliasResult AR = alias(MemoryLocation(*CI), MemoryLocation(Object));
-    // If this is a no-capture pointer argument, see if we can tell that it
-    // is impossible to alias the pointer we're checking.  If not, we have to
-    // assume that the call could touch the pointer, even though it doesn't
-    // escape.
-    if (AR != MustAlias)
-      IsMustAlias = false;
-    if (AR == NoAlias)
-      continue;
-    if (Call->doesNotAccessMemory(ArgNo))
-      continue;
-    if (Call->onlyReadsMemory(ArgNo)) {
-      R = ModRefInfo::Ref;
-      continue;
-    }
-    // Not returning MustModRef since we have not seen all the arguments.
-    return ModRefInfo::ModRef;
-  }
-  return IsMustAlias ? setMust(R) : clearMust(R);
+  return ArgModRefInfo;
 }
 
 /// canBasicBlockModify - Return true if it is possible for execution of the
