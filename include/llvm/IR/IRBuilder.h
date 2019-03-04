@@ -2124,12 +2124,15 @@ public:
   /// This is intended to implement C-style pointer subtraction. As such, the
   /// pointers must be appropriately aligned for their element types and
   /// pointing into the same object.
-  Value *CreatePtrDiff(Value *LHS, Value *RHS, const Twine &Name = "") {
+  Value *CreatePtrDiff(Value *LHS, Value *RHS, bool inbounds = false,
+                       const Twine &Name = "") {
     assert(LHS->getType() == RHS->getType() &&
            "Pointer subtraction operand types must match!");
     PointerType *ArgType = cast<PointerType>(LHS->getType());
+    Type *I1Ty = Type::getInt1Ty(Context);
+    Constant *Inbounds = ConstantInt::get(I1Ty, (uint64_t)inbounds);
     Type *psubTys[] = { Type::getInt64Ty(Context), ArgType, ArgType };
-    Value *psubArgs[] = { LHS, RHS };
+    Value *psubArgs[] = { LHS, RHS, Inbounds };
     Module *M = BB->getParent()->getParent();
     Value *Difference = CreateCall(Intrinsic::getDeclaration(M,
                   llvm::Intrinsic::psub, ArrayRef<llvm::Type *>(psubTys, 3)),

@@ -2588,7 +2588,7 @@ val build_is_not_null : llvalue -> string -> llbuilder -> llvalue
     the difference between two pointer values at the position specified by the
     instruction builder [b].
     See the method [llvm::LLVMBuilder::CreatePtrDiff]. *)
-val build_ptrdiff : llvalue -> llvalue -> string -> llbuilder -> llvalue
+val build_ptrdiff : llvalue -> llvalue -> bool -> string -> llbuilder -> llvalue
 
 
 (** {6 Memory buffers} *)

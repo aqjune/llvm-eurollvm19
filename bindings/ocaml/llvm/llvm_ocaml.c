@@ -2447,8 +2447,9 @@ CAMLprim LLVMValueRef llvm_build_is_not_null(LLVMValueRef Val, value Name,
 
 /* llvalue -> llvalue -> string -> llbuilder -> llvalue */
 CAMLprim LLVMValueRef llvm_build_ptrdiff(LLVMValueRef LHS, LLVMValueRef RHS,
-                                         value Name, value B) {
-  return LLVMBuildPtrDiff(Builder_val(B), LHS, RHS, String_val(Name));
+                                         bool Inbounds, value Name, value B) {
+  return LLVMBuildPtrDiff(Builder_val(B), LHS, RHS, Bool_val(Inbounds),
+                          String_val(Name));
 }
 
 /*===-- Memory buffers ----------------------------------------------------===*/

@@ -3712,8 +3712,10 @@ LLVMValueRef LLVMBuildIsNotNull(LLVMBuilderRef B, LLVMValueRef Val,
 }
 
 LLVMValueRef LLVMBuildPtrDiff(LLVMBuilderRef B, LLVMValueRef LHS,
-                              LLVMValueRef RHS, const char *Name) {
-  return wrap(unwrap(B)->CreatePtrDiff(unwrap(LHS), unwrap(RHS), Name));
+                              LLVMValueRef RHS, LLVMBool Inbounds,
+                              const char *Name) {
+  return wrap(unwrap(B)->CreatePtrDiff(unwrap(LHS), unwrap(RHS), Inbounds,
+                                       Name));
 }
 
 LLVMValueRef LLVMBuildAtomicRMW(LLVMBuilderRef B,LLVMAtomicRMWBinOp op,

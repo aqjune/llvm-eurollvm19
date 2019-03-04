@@ -1352,7 +1352,7 @@ external build_is_null : llvalue -> string -> llbuilder -> llvalue
                        = "llvm_build_is_null"
 external build_is_not_null : llvalue -> string -> llbuilder -> llvalue
                            = "llvm_build_is_not_null"
-external build_ptrdiff : llvalue -> llvalue -> string -> llbuilder -> llvalue
+external build_ptrdiff : llvalue -> llvalue -> bool -> string -> llbuilder -> llvalue
                        = "llvm_build_ptrdiff"
 
 
