@@ -584,7 +584,7 @@ bool IndVarSimplify::rewriteLoopExitValues(Loop *L, SCEVExpander &Rewriter) {
       if (PN->use_empty())
         continue; // dead use, don't replace it
 
-      if (!SE->isSCEVable(PN->getType()))
+      if (!SE->isSCEVable(PN->getType()) || PN->getType()->isIntOrIntVectorTy())
         continue;
 
       // It's necessary to tell ScalarEvolution about this explicitly so that
