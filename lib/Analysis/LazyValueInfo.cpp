@@ -19,6 +19,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/InstructionSimplify.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/ValueLattice.h"
@@ -28,6 +29,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -401,6 +403,7 @@ namespace {
 
     AssumptionCache *AC;  ///< A pointer to the cache of @llvm.assume calls.
     const DataLayout &DL; ///< A mandatory DataLayout
+    const TargetLibraryInfo *TLI; ///< A target library info
     DominatorTree *DT;    ///< An optional DT pointer.
     DominatorTree *DisabledDT; ///< Stores DT if it's disabled.
 
@@ -423,6 +426,8 @@ namespace {
                              BasicBlock *BB);
   Optional<ConstantRange> getRangeForOperand(unsigned Op, Instruction *I,
                                              BasicBlock *BB);
+  Optional<ConstantRange> getOffsetRangeForPtr(Value *Ptr, Value *UnderlyingObj,
+                                             BasicBlock *BB, unsigned MaxDepth=6);
   bool solveBlockValueBinaryOp(ValueLatticeElement &BBLV, BinaryOperator *BBI,
                                BasicBlock *BB);
   bool solveBlockValueCast(ValueLatticeElement &BBLV, CastInst *CI,
@@ -489,8 +494,9 @@ namespace {
     void threadEdge(BasicBlock *PredBB,BasicBlock *OldSucc,BasicBlock *NewSucc);
 
     LazyValueInfoImpl(AssumptionCache *AC, const DataLayout &DL,
+                       const TargetLibraryInfo *TLI,
                        DominatorTree *DT = nullptr)
-        : AC(AC), DL(DL), DT(DT), DisabledDT(nullptr) {}
+        : AC(AC), DL(DL), TLI(TLI), DT(DT), DisabledDT(nullptr) {}
   };
 } // end anonymous namespace
 
@@ -972,6 +978,128 @@ Optional<ConstantRange> LazyValueInfoImpl::getRangeForOperand(unsigned Op,
   return Range;
 }
 
+Optional<ConstantRange>
+LazyValueInfoImpl::getOffsetRangeForPtr(Value *Ptr, Value *UnderlyingObj,
+                                        BasicBlock *BB, unsigned MaxDepth) {
+  // If Ptr is a non-pointer type (e.g. vector type), return None 
+  errs() << "getOffsetRangeForPtr start! Ptr: " << *Ptr << "\n";
+  if (!Ptr->getType()->isPointerTy())
+    return None;
+
+  // NOTE: getOffsetRangeForPtr does not cache the analysis result because
+  // it requires storing pointers' underlying object as well.
+  int PtrSize = DL.getTypeSizeInBits(Ptr->getType());
+
+  if (Ptr == UnderlyingObj) {
+    // Return offset 0.
+    errs() << "getOffsetRangeForPtr end: It was offset 0.\n";
+    return ConstantRange(APInt(PtrSize, 0));
+  }
+  errs() << "getOffsetRangeForPtr 1\n";
+
+  if (MaxDepth == 0)
+    return None;
+
+  if (BitCastInst *BCI = dyn_cast<BitCastInst>(Ptr))
+    return getOffsetRangeForPtr(BCI->getOperand(0), UnderlyingObj, BB, MaxDepth - 1);
+
+  if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(Ptr)) {
+    errs() << "getOffsetRangeForPtr 2\n";
+    // Get an offset range for the base pointer
+    Optional<ConstantRange> baseRange = getOffsetRangeForPtr(
+        GEPI->getPointerOperand(), UnderlyingObj, BB, MaxDepth - 1);
+
+    // Get an in-bounds offset range of the underlying object
+    uint64_t objsize;
+    bool hasStaticSize = getObjectSize(UnderlyingObj, objsize, DL, TLI);
+    ConstantRange underlyingObjSize = ConstantRange(PtrSize);
+    if (hasStaticSize)
+      underlyingObjSize = ConstantRange(APInt(PtrSize, 0),
+                                        APInt(PtrSize, objsize));
+
+    // If the GEP is inbounds, we can assume that the underlying pointer
+    // lies within underlyingObjSize
+    if (GEPI->isInBounds()) {
+      if (baseRange != None)
+        // Update the offset range of the base pointer
+        baseRange = baseRange.getValue().intersectWith(underlyingObjSize);
+      else
+        baseRange = underlyingObjSize;
+    }
+
+    // If it is impossible to get the offset range of baseRange, bail out.
+    if (baseRange == None) {
+      errs() << "getOffsetRangeForPtr end: unknown base range: " << *Ptr << "\n";
+      return None;
+    }
+
+    errs() << "getOffsetRangeForPtr 3\n";
+    // If it has constant offset, use it
+    APInt ConstOfs(PtrSize, 0);
+    if (GEPI->accumulateConstantOffset(DL, ConstOfs)) {
+      errs() << "getOffsetRangeForPtr Done! It was constant offset: " << ConstOfs << "\n";
+      if (baseRange == None)
+        return None;
+
+      return baseRange.getValue().add(ConstantRange(ConstOfs));
+    }
+
+    errs() << "getOffsetRangeForPtr 4\n";
+    ConstantRange resultRange = baseRange.getValue();
+    gep_type_iterator GTI = gep_type_begin(GEPI);
+    for (User::op_iterator I = GEPI->op_begin() + 1, E = GEPI->op_end();
+         I != E; ++I, ++GTI) {
+      // Get i'th index operand
+      auto allocsz = DL.getTypeAllocSize(GTI.getIndexedType());
+      Value *Index = *I;
+      errs() << "Offset: " << *Index << "\n";
+
+      if (ConstantInt *CIdx = dyn_cast<ConstantInt>(Index)) {
+        APInt Ofs = allocsz * CIdx->getValue().sextOrSelf(PtrSize)
+                      .sextOrTrunc(PtrSize);
+        resultRange = resultRange.add(ConstantRange(Ofs));
+
+      } else {
+        bool hasAvail = false;
+        if (!hasBlockValue(Index, BB)) {
+          errs() << "\tUnknown offset!" << "\n";
+          if (pushBlockValue(std::make_pair(BB, Index)))
+            return None;
+
+          if (GEPI->isInBounds()) {
+            // Just return the underlyngObjSize.
+            return Optional<ConstantRange>(underlyingObjSize);
+          } else {
+            // A new index is added
+            return None;
+          }
+        } else {
+          ValueLatticeElement Val = getBlockValue(Index, BB);
+          if (Val.isConstantRange()) {
+            ConstantRange IdxRange = Val.getConstantRange();
+            IdxRange = IdxRange.multiply(ConstantRange(APInt(PtrSize, allocsz)));
+            resultRange = resultRange.add(IdxRange);
+            hasAvail = true;
+          }
+          if (!hasAvail) {
+            // No available value.
+            // If GEPI has inbounds, we can return the size of underlying
+            // object.
+            return GEPI->isInBounds() ?
+                   Optional<ConstantRange>(underlyingObjSize) : None;
+          }
+        }
+      }
+    }
+
+    errs() << "getOffsetRangeForPtr end!\n";
+    return resultRange;
+  }
+
+  errs() << "getOffsetRangeForPtr end! returning None.\n";
+  return None;
+}
+
 bool LazyValueInfoImpl::solveBlockValueCast(ValueLatticeElement &BBLV,
                                             CastInst *CI,
                                             BasicBlock *BB) {
@@ -1025,12 +1153,41 @@ bool LazyValueInfoImpl::solveBlockValueBinaryOp(ValueLatticeElement &BBLV,
   assert(BO->getOperand(0)->getType()->isSized() &&
          "all operands to binary operators are sized");
 
+  const DataLayout &DL = BO->getModule()->getDataLayout();
   // Filter out operators we don't know how to reason about before attempting to
   // recurse on our operand(s).  This can cut a long search short if we know
   // we're not going to be able to get any useful information anyways.
   switch (BO->getOpcode()) {
+  case Instruction::Sub: {
+    Value *Op0 = BO->getOperand(0), *Op1 = BO->getOperand(1);
+    Value *Ptr0, *Ptr1;
+    if (match(Op0, m_PtrToInt(m_Value(Ptr0))) &&
+        match(Op1, m_PtrToInt(m_Value(Ptr1)))) {
+      // Pointer subtraction.
+      errs() << "Oh. 1\n";
+      Value *UO0 = GetUnderlyingObject(Ptr0, DL);
+      // If underlying objects are same..
+      if (UO0 == GetUnderlyingObject(Ptr1, DL)) {
+        errs() << "Oh. 2\n";
+        // Get ConstantRanges of offsets from the underlying object
+        Optional<ConstantRange> LHSOfsRes = getOffsetRangeForPtr(Ptr0, UO0, BB);
+        Optional<ConstantRange> RHSOfsRes = getOffsetRangeForPtr(Ptr1, UO0, BB);
+
+        if (LHSOfsRes.hasValue() && RHSOfsRes.hasValue()) {
+          errs() << "Oh. 3\n";
+          ConstantRange LHSRange = LHSOfsRes.getValue();
+          ConstantRange RHSRange = RHSOfsRes.getValue();
+          BBLV = ValueLatticeElement::getRange(LHSRange.binaryOp(
+              Instruction::Sub, RHSRange));
+          return true;
+        } else {
+          // Cannot get accurate result
+          return false;
+        }
+      }
+    }
+  }
   case Instruction::Add:
-  case Instruction::Sub:
   case Instruction::Mul:
   case Instruction::UDiv:
   case Instruction::Shl:
@@ -1468,10 +1625,11 @@ void LazyValueInfoImpl::threadEdge(BasicBlock *PredBB, BasicBlock *OldSucc,
 /// This lazily constructs the LazyValueInfoImpl.
 static LazyValueInfoImpl &getImpl(void *&PImpl, AssumptionCache *AC,
                                   const DataLayout *DL,
+                                  const TargetLibraryInfo *TLI,
                                   DominatorTree *DT = nullptr) {
   if (!PImpl) {
     assert(DL && "getCache() called with a null DataLayout");
-    PImpl = new LazyValueInfoImpl(AC, *DL, DT);
+    PImpl = new LazyValueInfoImpl(AC, *DL, TLI, DT);
   }
   return *static_cast<LazyValueInfoImpl*>(PImpl);
 }
@@ -1486,7 +1644,7 @@ bool LazyValueInfoWrapperPass::runOnFunction(Function &F) {
   Info.TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
 
   if (Info.PImpl)
-    getImpl(Info.PImpl, Info.AC, &DL, Info.DT).clear();
+    getImpl(Info.PImpl, Info.AC, &DL, Info.TLI, Info.DT).clear();
 
   // Fully lazy.
   return false;
@@ -1505,7 +1663,7 @@ LazyValueInfo::~LazyValueInfo() { releaseMemory(); }
 void LazyValueInfo::releaseMemory() {
   // If the cache was allocated, free it.
   if (PImpl) {
-    delete &getImpl(PImpl, AC, nullptr);
+    delete &getImpl(PImpl, AC, nullptr, nullptr);
     PImpl = nullptr;
   }
 }
@@ -1555,7 +1713,7 @@ Constant *LazyValueInfo::getConstant(Value *V, BasicBlock *BB,
 
   const DataLayout &DL = BB->getModule()->getDataLayout();
   ValueLatticeElement Result =
-      getImpl(PImpl, AC, &DL, DT).getValueInBlock(V, BB, CxtI);
+      getImpl(PImpl, AC, &DL, TLI, DT).getValueInBlock(V, BB, CxtI);
 
   if (Result.isConstant())
     return Result.getConstant();
@@ -1573,7 +1731,7 @@ ConstantRange LazyValueInfo::getConstantRange(Value *V, BasicBlock *BB,
   unsigned Width = V->getType()->getIntegerBitWidth();
   const DataLayout &DL = BB->getModule()->getDataLayout();
   ValueLatticeElement Result =
-      getImpl(PImpl, AC, &DL, DT).getValueInBlock(V, BB, CxtI);
+      getImpl(PImpl, AC, &DL, TLI, DT).getValueInBlock(V, BB, CxtI);
   if (Result.isUndefined())
     return ConstantRange(Width, /*isFullSet=*/false);
   if (Result.isConstantRange())
@@ -1592,7 +1750,7 @@ Constant *LazyValueInfo::getConstantOnEdge(Value *V, BasicBlock *FromBB,
                                            Instruction *CxtI) {
   const DataLayout &DL = FromBB->getModule()->getDataLayout();
   ValueLatticeElement Result =
-      getImpl(PImpl, AC, &DL, DT).getValueOnEdge(V, FromBB, ToBB, CxtI);
+      getImpl(PImpl, AC, &DL, TLI, DT).getValueOnEdge(V, FromBB, ToBB, CxtI);
 
   if (Result.isConstant())
     return Result.getConstant();
@@ -1611,7 +1769,7 @@ ConstantRange LazyValueInfo::getConstantRangeOnEdge(Value *V,
   unsigned Width = V->getType()->getIntegerBitWidth();
   const DataLayout &DL = FromBB->getModule()->getDataLayout();
   ValueLatticeElement Result =
-      getImpl(PImpl, AC, &DL, DT).getValueOnEdge(V, FromBB, ToBB, CxtI);
+      getImpl(PImpl, AC, &DL, TLI, DT).getValueOnEdge(V, FromBB, ToBB, CxtI);
 
   if (Result.isUndefined())
     return ConstantRange(Width, /*isFullSet=*/false);
@@ -1697,7 +1855,7 @@ LazyValueInfo::getPredicateOnEdge(unsigned Pred, Value *V, Constant *C,
                                   Instruction *CxtI) {
   const DataLayout &DL = FromBB->getModule()->getDataLayout();
   ValueLatticeElement Result =
-      getImpl(PImpl, AC, &DL, DT).getValueOnEdge(V, FromBB, ToBB, CxtI);
+      getImpl(PImpl, AC, &DL, TLI, DT).getValueOnEdge(V, FromBB, ToBB, CxtI);
 
   return getPredicateResult(Pred, C, Result, DL, TLI);
 }
@@ -1717,7 +1875,7 @@ LazyValueInfo::getPredicateAt(unsigned Pred, Value *V, Constant *C,
     else if (Pred == ICmpInst::ICMP_NE)
       return LazyValueInfo::True;
   }
-  ValueLatticeElement Result = getImpl(PImpl, AC, &DL, DT).getValueAt(V, CxtI);
+  ValueLatticeElement Result = getImpl(PImpl, AC, &DL, TLI, DT).getValueAt(V, CxtI);
   Tristate Ret = getPredicateResult(Pred, C, Result, DL, TLI);
   if (Ret != Unknown)
     return Ret;
@@ -1807,32 +1965,32 @@ void LazyValueInfo::threadEdge(BasicBlock *PredBB, BasicBlock *OldSucc,
                                BasicBlock *NewSucc) {
   if (PImpl) {
     const DataLayout &DL = PredBB->getModule()->getDataLayout();
-    getImpl(PImpl, AC, &DL, DT).threadEdge(PredBB, OldSucc, NewSucc);
+    getImpl(PImpl, AC, &DL, TLI, DT).threadEdge(PredBB, OldSucc, NewSucc);
   }
 }
 
 void LazyValueInfo::eraseBlock(BasicBlock *BB) {
   if (PImpl) {
     const DataLayout &DL = BB->getModule()->getDataLayout();
-    getImpl(PImpl, AC, &DL, DT).eraseBlock(BB);
+    getImpl(PImpl, AC, &DL, TLI, DT).eraseBlock(BB);
   }
 }
 
 
 void LazyValueInfo::printLVI(Function &F, DominatorTree &DTree, raw_ostream &OS) {
   if (PImpl) {
-    getImpl(PImpl, AC, DL, DT).printLVI(F, DTree, OS);
+    getImpl(PImpl, AC, DL, TLI, DT).printLVI(F, DTree, OS);
   }
 }
 
 void LazyValueInfo::disableDT() {
   if (PImpl)
-    getImpl(PImpl, AC, DL, DT).disableDT();
+    getImpl(PImpl, AC, DL, TLI, DT).disableDT();
 }
 
 void LazyValueInfo::enableDT() {
   if (PImpl)
-    getImpl(PImpl, AC, DL, DT).enableDT();
+    getImpl(PImpl, AC, DL, TLI, DT).enableDT();
 }
 
 // Print the LVI for the function arguments at the start of each basic block.
