@@ -4779,6 +4779,89 @@ static Instruction *foldVectorCmp(CmpInst &Cmp,
   return nullptr;
 }
 
+bool InstCombiner::OptimizeICmpOrPsubUsingUnderlyingObj(Instruction *I) {
+  assert((I->getOpcode() == Instruction::ICmp || I->getOpcode() == Instruction::Call) &&
+         "I should be either icmp or call llvm.psub");
+
+  if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I))
+    assert((II->getIntrinsicID() == Intrinsic::psub) &&
+           "I should be either icmp or call llvm.psub");
+
+  auto setOperand = [I](unsigned i, Value *V) {
+    if (I->getOpcode() == Instruction::ICmp) {
+      I->setOperand(i, V);
+    } else {
+      IntrinsicInst *II = dyn_cast<IntrinsicInst>(I);
+      II->setArgOperand(i, V);
+    }
+  };
+
+  Value *Op0 = nullptr, *Op1 = nullptr;
+  if (I->getOpcode() == Instruction::ICmp) {
+    Op0 = I->getOperand(0);
+    Op1 = I->getOperand(1);
+  } else {
+    IntrinsicInst *II = dyn_cast<IntrinsicInst>(I);
+    Op0 = II->getArgOperand(0);
+    Op1 = II->getArgOperand(1);
+  }
+
+  auto &DL = this->DL;
+  Value *UObj0 = GetUnderlyingObject(Op0, DL);
+  Value *UObj1 = GetUnderlyingObject(Op1, DL);
+
+  auto stripIPICasts = [&DL](Value *V) -> Value *{
+    if (IntToPtrInst *II = dyn_cast<IntToPtrInst>(V)) {
+      PointerType *ResTy = dyn_cast<PointerType>(II->getType());
+      Value *IIOp = II->getOperand(0);
+
+      if (PtrToIntInst *PI = dyn_cast<PtrToIntInst>(IIOp)) {
+        Value *PIOp = PI->getOperand(0);
+        PointerType *SrcTy = dyn_cast<PointerType>(PIOp->getType());
+        // Be conservative and check whether the output and input
+        // pointer's address space are the same.
+        if (ResTy->getAddressSpace() != SrcTy->getAddressSpace())
+          return nullptr;
+
+        // Intermediate integer type's size should not be smaller than
+        // the size of pointer type.
+        if (PI->getType()->getIntegerBitWidth() <
+            DL.getPointerTypeSizeInBits(SrcTy))
+          return nullptr;
+
+        return PI->getOperand(0);
+      }
+    }
+    return nullptr;
+  };
+
+  if (Value *StripOp0 = stripIPICasts(Op0)) {
+    if (GetUnderlyingObject(StripOp0, DL) == UObj1) {
+      // icmp (inttoptr(ptrtoint(p)), Op1) -> icmp p, Op1
+      // if p and Op1 has same underlying object
+      Worklist.Add(dyn_cast<Instruction>(Op0));
+      Value *Cast = Builder.CreateBitCast(StripOp0, Op1->getType());
+      setOperand(0, Cast);
+      Worklist.Add(I);
+      return true;
+    }
+  }
+
+  if (Value *StripOp1 = stripIPICasts(Op1)) {
+    if (GetUnderlyingObject(StripOp1, DL) == UObj0) {
+      // icmp (Op0, inttoptr(ptrtoint(q))) -> icmp Op0, q
+      // if Op0 and q has same underlying object
+      Worklist.Add(dyn_cast<Instruction>(Op1));
+      Value *Cast = Builder.CreateBitCast(StripOp1, Op0->getType());
+      setOperand(1, Cast);
+      Worklist.Add(I);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 Instruction *InstCombiner::visitICmpInst(ICmpInst &I) {
   bool Changed = false;
   Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);
@@ -4889,9 +4972,25 @@ Instruction *InstCombiner::visitICmpInst(ICmpInst &I) {
                            ICmpInst::getSwappedPredicate(I.getPredicate()), I))
       return NI;
 
-  // Try to optimize equality comparisons against alloca-based pointers.
   if (Op0->getType()->isPointerTy() && I.isEquality()) {
     assert(Op1->getType()->isPointerTy() && "Comparing pointer with non-pointer?");
+
+    // icmp(inttoptr i, inttoptr j) -> icmp(i, j)
+    if (isa<IntToPtrInst>(Op0) && isa<IntToPtrInst>(Op1)) {
+      IntToPtrInst *I0 = dyn_cast<IntToPtrInst>(Op0);
+      IntToPtrInst *I1 = dyn_cast<IntToPtrInst>(Op1);
+      Value *New = Builder.CreateICmp(I.getPredicate(), I0->getOperand(0),
+                                      I1->getOperand(0), I.getName());
+      return replaceInstUsesWith(I, New);
+    }
+
+    // icmp (inttoptr(ptrtoint(p)), q) -> icmp p, q
+    // if p and q has same underlying object
+    // (same for icmp p, inttoptr(ptrtoint q))
+    if (OptimizeICmpOrPsubUsingUnderlyingObj(&I))
+      return &I;
+
+    // Try to optimize equality comparisons against alloca-based pointers.
     if (auto *Alloca = dyn_cast<AllocaInst>(GetUnderlyingObject(Op0, DL)))
       if (Instruction *New = foldAllocaCmp(I, Alloca, Op1))
         return New;

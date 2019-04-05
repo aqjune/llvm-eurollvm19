@@ -932,6 +932,8 @@ private:
 
   Value *EvaluateInDifferentType(Value *V, Type *Ty, bool isSigned);
 
+  bool OptimizeICmpOrPsubUsingUnderlyingObj(Instruction *I);
+
   /// Returns a value X such that Val = X * Scale, or null if none.
   ///
   /// If the multiplication is known not to overflow then NoSignedWrap is set.
