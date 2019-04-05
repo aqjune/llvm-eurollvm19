@@ -4807,8 +4807,6 @@ bool InstCombiner::OptimizeICmpOrPsubUsingUnderlyingObj(Instruction *I) {
   }
 
   auto &DL = this->DL;
-  Value *UObj0 = GetUnderlyingObject(Op0, DL);
-  Value *UObj1 = GetUnderlyingObject(Op1, DL);
 
   auto stripIPICasts = [&DL](Value *V) -> Value *{
     if (IntToPtrInst *II = dyn_cast<IntToPtrInst>(V)) {
@@ -4835,10 +4833,47 @@ bool InstCombiner::OptimizeICmpOrPsubUsingUnderlyingObj(Instruction *I) {
     return nullptr;
   };
 
-  if (Value *StripOp0 = stripIPICasts(Op0)) {
+  Value *StripOp0 = stripIPICasts(Op0);
+  Value *StripOp1 = stripIPICasts(Op1);
+
+  // icmp (inttoptr(ptrtoint(gep(inttoptr i), j)), p) ->
+  // icmp (gep(inttoptr i), j), p
+  // (same for psub)
+  if (StripOp0) {
+    if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(StripOp0)) {
+      if (isa<IntToPtrInst>(GEPI->getOperand(0))) {
+        Worklist.Add(dyn_cast<Instruction>(Op0));
+        Value *Cast = Builder.CreateBitCast(StripOp0, Op1->getType());
+        setOperand(0, Cast);
+        Worklist.Add(I);
+        return true;
+      }
+    }
+  }
+
+  // icmp (p, inttoptr(ptrtoint(gep(inttoptr i), j)) ->
+  // icmp (p, gep(inttoptr i), j)
+  // (same for psub)
+  if (StripOp1) {
+    if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(StripOp1)) {
+      if (isa<IntToPtrInst>(GEPI->getOperand(0))) {
+        Worklist.Add(dyn_cast<Instruction>(Op1));
+        Value *Cast = Builder.CreateBitCast(StripOp1, Op0->getType());
+        setOperand(1, Cast);
+        Worklist.Add(I);
+        return true;
+      }
+    }
+  }
+
+  Value *UObj0 = GetUnderlyingObject(Op0, DL);
+  Value *UObj1 = GetUnderlyingObject(Op1, DL);
+
+  // icmp (inttoptr(ptrtoint(p)), Op1) -> icmp p, Op1
+  // if p and Op1 has same underlying object
+  // (same for psub)
+  if (StripOp0) {
     if (GetUnderlyingObject(StripOp0, DL) == UObj1) {
-      // icmp (inttoptr(ptrtoint(p)), Op1) -> icmp p, Op1
-      // if p and Op1 has same underlying object
       Worklist.Add(dyn_cast<Instruction>(Op0));
       Value *Cast = Builder.CreateBitCast(StripOp0, Op1->getType());
       setOperand(0, Cast);
@@ -4847,10 +4882,11 @@ bool InstCombiner::OptimizeICmpOrPsubUsingUnderlyingObj(Instruction *I) {
     }
   }
 
-  if (Value *StripOp1 = stripIPICasts(Op1)) {
+  // icmp (Op0, inttoptr(ptrtoint(q))) -> icmp Op0, q
+  // if Op0 and q has same underlying object
+  // (same for psub)
+  if (StripOp1) {
     if (GetUnderlyingObject(StripOp1, DL) == UObj0) {
-      // icmp (Op0, inttoptr(ptrtoint(q))) -> icmp Op0, q
-      // if Op0 and q has same underlying object
       Worklist.Add(dyn_cast<Instruction>(Op1));
       Value *Cast = Builder.CreateBitCast(StripOp1, Op0->getType());
       setOperand(1, Cast);
