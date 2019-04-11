@@ -426,7 +426,7 @@ namespace {
                              BasicBlock *BB);
   Optional<ConstantRange> getRangeForOperand(unsigned Op, Instruction *I,
                                              BasicBlock *BB);
-  Optional<ConstantRange> getOffsetRangeForPtr(Value *Ptr, Value *UnderlyingObj,
+  ValueLatticeElement getOffsetRangeForPtr(Value *Ptr, Value *UnderlyingObj,
                                              BasicBlock *BB, unsigned MaxDepth=6);
   bool solveBlockValueBinaryOp(ValueLatticeElement &BBLV, BinaryOperator *BBI,
                                BasicBlock *BB);
@@ -978,13 +978,12 @@ Optional<ConstantRange> LazyValueInfoImpl::getRangeForOperand(unsigned Op,
   return Range;
 }
 
-Optional<ConstantRange>
+ValueLatticeElement
 LazyValueInfoImpl::getOffsetRangeForPtr(Value *Ptr, Value *UnderlyingObj,
                                         BasicBlock *BB, unsigned MaxDepth) {
-  // If Ptr is a non-pointer type (e.g. vector type), return None 
-  errs() << "getOffsetRangeForPtr start! Ptr: " << *Ptr << "\n";
+  //errs() << "getOffsetRangeForPtr start! Ptr: " << *Ptr << "\n";
   if (!Ptr->getType()->isPointerTy())
-    return None;
+    return ValueLatticeElement::getOverdefined();
 
   // NOTE: getOffsetRangeForPtr does not cache the analysis result because
   // it requires storing pointers' underlying object as well.
@@ -992,67 +991,75 @@ LazyValueInfoImpl::getOffsetRangeForPtr(Value *Ptr, Value *UnderlyingObj,
 
   if (Ptr == UnderlyingObj) {
     // Return offset 0.
-    errs() << "getOffsetRangeForPtr end: It was offset 0.\n";
-    return ConstantRange(APInt(PtrSize, 0));
+    //errs() << "getOffsetRangeForPtr end: It was offset 0.\n";
+    return ValueLatticeElement::getRange(ConstantRange(APInt(PtrSize, 0)));
   }
-  errs() << "getOffsetRangeForPtr 1\n";
+  //errs() << "getOffsetRangeForPtr 1\n";
 
   if (MaxDepth == 0)
-    return None;
+    return ValueLatticeElement::getOverdefined();
 
   if (BitCastInst *BCI = dyn_cast<BitCastInst>(Ptr))
     return getOffsetRangeForPtr(BCI->getOperand(0), UnderlyingObj, BB, MaxDepth - 1);
 
   if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(Ptr)) {
-    errs() << "getOffsetRangeForPtr 2\n";
+    //errs() << "getOffsetRangeForPtr 2\n";
     // Get an offset range for the base pointer
-    Optional<ConstantRange> baseRange = getOffsetRangeForPtr(
+    ValueLatticeElement baseElem = getOffsetRangeForPtr(
         GEPI->getPointerOperand(), UnderlyingObj, BB, MaxDepth - 1);
+
+    // If base range is undefined, just return undefined
+    if (baseElem.isUndefined())
+      return baseElem;
 
     // Get an in-bounds offset range of the underlying object
     uint64_t objsize;
     bool hasStaticSize = getObjectSize(UnderlyingObj, objsize, DL, TLI);
     ConstantRange underlyingObjSize = ConstantRange(PtrSize);
+
     if (hasStaticSize)
       underlyingObjSize = ConstantRange(APInt(PtrSize, 0),
-                                        APInt(PtrSize, objsize));
+                                        APInt(PtrSize, objsize + 1));
 
     // If the GEP is inbounds, we can assume that the underlying pointer
     // lies within underlyingObjSize
     if (GEPI->isInBounds()) {
-      if (baseRange != None)
+      if (baseElem.isConstantRange()) {
         // Update the offset range of the base pointer
-        baseRange = baseRange.getValue().intersectWith(underlyingObjSize);
-      else
-        baseRange = underlyingObjSize;
+        ConstantRange basecr = baseElem.getConstantRange();
+        baseElem = ValueLatticeElement::getRange(basecr.intersectWith(underlyingObjSize));
+      } else
+        baseElem = ValueLatticeElement::getRange(underlyingObjSize);
     }
 
     // If it is impossible to get the offset range of baseRange, bail out.
-    if (baseRange == None) {
-      errs() << "getOffsetRangeForPtr end: unknown base range: " << *Ptr << "\n";
-      return None;
+    if (baseElem.isOverdefined()) {
+      //errs() << "getOffsetRangeForPtr end: unknown base range: " << *Ptr << "\n";
+      return baseElem;
     }
 
-    errs() << "getOffsetRangeForPtr 3\n";
+    //errs() << "getOffsetRangeForPtr 3\n";
+    ConstantRange baseRange = baseElem.getConstantRange();
+
     // If it has constant offset, use it
     APInt ConstOfs(PtrSize, 0);
     if (GEPI->accumulateConstantOffset(DL, ConstOfs)) {
-      errs() << "getOffsetRangeForPtr Done! It was constant offset: " << ConstOfs << "\n";
-      if (baseRange == None)
-        return None;
+      //errs() << "getOffsetRangeForPtr Done! It was constant offset: " << ConstOfs << "\n";
 
-      return baseRange.getValue().add(ConstantRange(ConstOfs));
+      return ValueLatticeElement::getRange(baseRange.add(ConstantRange(ConstOfs)));
     }
 
-    errs() << "getOffsetRangeForPtr 4\n";
-    ConstantRange resultRange = baseRange.getValue();
+    //errs() << "getOffsetRangeForPtr 4\n";
+    ConstantRange resultRange = baseRange;
+
     gep_type_iterator GTI = gep_type_begin(GEPI);
+
     for (User::op_iterator I = GEPI->op_begin() + 1, E = GEPI->op_end();
          I != E; ++I, ++GTI) {
       // Get i'th index operand
       auto allocsz = DL.getTypeAllocSize(GTI.getIndexedType());
       Value *Index = *I;
-      errs() << "Offset: " << *Index << "\n";
+      //errs() << "Offset: " << *Index << "\n";
 
       if (ConstantInt *CIdx = dyn_cast<ConstantInt>(Index)) {
         APInt Ofs = allocsz * CIdx->getValue().sextOrSelf(PtrSize)
@@ -1060,44 +1067,50 @@ LazyValueInfoImpl::getOffsetRangeForPtr(Value *Ptr, Value *UnderlyingObj,
         resultRange = resultRange.add(ConstantRange(Ofs));
 
       } else {
-        bool hasAvail = false;
         if (!hasBlockValue(Index, BB)) {
-          errs() << "\tUnknown offset!" << "\n";
-          if (pushBlockValue(std::make_pair(BB, Index)))
-            return None;
+          //errs() << "\tUnknown offset!: " << *Index << "\n";
+          //errs() << "\tReturning.. (Ptr: " << *Ptr << ")\n";
+          if (pushBlockValue(std::make_pair(BB, Index))) {
+            // Return undefined
+            return ValueLatticeElement();
+          }
 
           if (GEPI->isInBounds()) {
+            //errs() << "\tReturning..(inb)\n";
             // Just return the underlyngObjSize.
-            return Optional<ConstantRange>(underlyingObjSize);
+            return ValueLatticeElement::getRange(underlyingObjSize);
           } else {
-            // A new index is added
-            return None;
+            //errs() << "\tReturning..\n";
+            // Return overdefined
+            return ValueLatticeElement::getOverdefined();
           }
         } else {
           ValueLatticeElement Val = getBlockValue(Index, BB);
+          assert(!Val.isUndefined());
+
           if (Val.isConstantRange()) {
             ConstantRange IdxRange = Val.getConstantRange();
             IdxRange = IdxRange.multiply(ConstantRange(APInt(PtrSize, allocsz)));
             resultRange = resultRange.add(IdxRange);
-            hasAvail = true;
-          }
-          if (!hasAvail) {
-            // No available value.
-            // If GEPI has inbounds, we can return the size of underlying
-            // object.
-            return GEPI->isInBounds() ?
-                   Optional<ConstantRange>(underlyingObjSize) : None;
+          } else {
+            // Be conservative here.
+            //errs() << "\tReturning..\n";
+            if (GEPI->isInBounds()) {
+              return ValueLatticeElement::getRange(underlyingObjSize);
+            } else {
+              return ValueLatticeElement::getOverdefined();
+            }
           }
         }
       }
     }
 
-    errs() << "getOffsetRangeForPtr end!\n";
-    return resultRange;
+    //errs() << "getOffsetRangeForPtr end!\n";
+    return ValueLatticeElement::getRange(resultRange);
   }
 
-  errs() << "getOffsetRangeForPtr end! returning None.\n";
-  return None;
+  //errs() << "getOffsetRangeForPtr end! returning Overdefined.\n";
+  return ValueLatticeElement::getOverdefined();
 }
 
 bool LazyValueInfoImpl::solveBlockValueCast(ValueLatticeElement &BBLV,
@@ -1164,21 +1177,23 @@ bool LazyValueInfoImpl::solveBlockValueBinaryOp(ValueLatticeElement &BBLV,
     if (match(Op0, m_PtrToInt(m_Value(Ptr0))) &&
         match(Op1, m_PtrToInt(m_Value(Ptr1)))) {
       // Pointer subtraction.
-      errs() << "Oh. 1\n";
+      //errs() << "---LVI: ptr sub matched: " << *BO << "\n";
       Value *UO0 = GetUnderlyingObject(Ptr0, DL);
       // If underlying objects are same..
       if (UO0 == GetUnderlyingObject(Ptr1, DL)) {
-        errs() << "Oh. 2\n";
+        //errs() << "---LVI: Underlying obj found: " << *UO0 << "\n";
         // Get ConstantRanges of offsets from the underlying object
-        Optional<ConstantRange> LHSOfsRes = getOffsetRangeForPtr(Ptr0, UO0, BB);
-        Optional<ConstantRange> RHSOfsRes = getOffsetRangeForPtr(Ptr1, UO0, BB);
+        ValueLatticeElement LHSOfsRes = getOffsetRangeForPtr(Ptr0, UO0, BB);
+        //errs() << "--\n";
+        ValueLatticeElement RHSOfsRes = getOffsetRangeForPtr(Ptr1, UO0, BB);
 
-        if (LHSOfsRes.hasValue() && RHSOfsRes.hasValue()) {
-          errs() << "Oh. 3\n";
-          ConstantRange LHSRange = LHSOfsRes.getValue();
-          ConstantRange RHSRange = RHSOfsRes.getValue();
-          BBLV = ValueLatticeElement::getRange(LHSRange.binaryOp(
-              Instruction::Sub, RHSRange));
+        if (LHSOfsRes.isConstantRange() && RHSOfsRes.isConstantRange()) {
+          //errs() << "---LVI: LHS and RHS both are const range\n";
+          ConstantRange LHSRange = LHSOfsRes.getConstantRange();
+          ConstantRange RHSRange = RHSOfsRes.getConstantRange();
+          ConstantRange DiffRange = LHSRange.binaryOp(Instruction::Sub, RHSRange);
+          BBLV = ValueLatticeElement::getRange(DiffRange);
+          //errs() << "---LVI: Result: " << DiffRange << "\n";
           return true;
         } else {
           // Cannot get accurate result
